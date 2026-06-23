@@ -8,7 +8,7 @@ exposed. For reverse-engineering, bug bounty, and anyone who wants to read
 the conversation an app is having about them.
 
 ```
-pip install wspectre
+pipx install git+https://github.com/SaxxSaxx/wspectre
 ```
 
 ### listen
