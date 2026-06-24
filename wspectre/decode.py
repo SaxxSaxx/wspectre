@@ -6,11 +6,44 @@ and tells you which one fits, plus a readable rendering.
 """
 import base64
 import binascii
-import gzip
 import json
 import re
+import zlib
 
 _B64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+
+# Payloads arrive from an untrusted peer. Cap any amplifying decode so a hostile
+# frame can't exhaust memory (decompression bombs, declared-huge containers).
+MAX_DECODE_BYTES = 4 * 1024 * 1024
+
+
+def _safe_gunzip(data, limit=MAX_DECODE_BYTES):
+    """Bounded gzip inflate — returns None if the stream expands past `limit`."""
+    dec = zlib.decompressobj(31)  # wbits=31 -> gzip framing
+    try:
+        out = dec.decompress(data, limit)
+        if dec.unconsumed_tail:  # more output was waiting: treat as a bomb
+            return None
+        out += dec.flush()
+    except zlib.error:
+        return None
+    return out if len(out) <= limit else None
+
+
+def _sanitize_ctrl(text):
+    """Escape terminal-control bytes so a payload can't drive the terminal.
+
+    Keeps tab/newline and ordinary printable text; renders C0/C1/DEL controls
+    (ESC, CSI, BEL, ...) as visible \\xNN so they're seen, not executed.
+    """
+    out = []
+    for ch in text:
+        o = ord(ch)
+        if ch in "\t\n" or 0x20 <= o <= 0x7E or o >= 0xA0:
+            out.append(ch)
+        else:
+            out.append(f"\\x{o:02x}")
+    return "".join(out)
 
 try:  # optional — msgpack detection is a bonus, not a dependency
     import msgpack
@@ -30,7 +63,9 @@ def _is_json(s):
 
 
 def _pretty_json(s):
-    return json.dumps(json.loads(s), indent=2, ensure_ascii=False)
+    # ensure_ascii=True escapes every non-ascii (incl. C1 controls) to \uNNNN,
+    # so rendered json can't smuggle terminal escapes either.
+    return json.dumps(json.loads(s), indent=2, ensure_ascii=True)
 
 
 def _b64_meaningful(s):
@@ -67,8 +102,8 @@ def _classify_text(s):
         return ("json", _pretty_json(s))
     b64 = _b64_meaningful(s)
     if b64 is not None:
-        return ("base64", b64)
-    return ("text", s)
+        return ("base64", _sanitize_ctrl(b64))
+    return ("text", _sanitize_ctrl(s))
 
 
 def classify(data, is_text):
@@ -83,17 +118,22 @@ def classify(data, is_text):
         return _classify_text(data.decode("utf-8", "replace"))
 
     if data[:2] == b"\x1f\x8b":
-        try:
-            kind, rendered = classify(gzip.decompress(data), False)
+        inflated = _safe_gunzip(data)
+        if inflated is not None:
+            kind, rendered = classify(inflated, False)
             return ("gzip>" + kind, rendered)
-        except Exception:
-            pass
 
     if msgpack is not None:
         try:
-            obj = msgpack.unpackb(data, raw=False)
+            # Bound every declared length to the actual buffer: a container can't
+            # hold more elements than there are bytes, so this can't over-allocate.
+            n = min(len(data), MAX_DECODE_BYTES)
+            obj = msgpack.unpackb(
+                data, raw=False, strict_map_key=False,
+                max_str_len=n, max_bin_len=n, max_array_len=n, max_map_len=n, max_ext_len=n,
+            )
             if isinstance(obj, (dict, list)):
-                return ("msgpack", json.dumps(obj, indent=2, default=str, ensure_ascii=False))
+                return ("msgpack", json.dumps(obj, indent=2, default=str, ensure_ascii=True))
         except Exception:
             pass
 
